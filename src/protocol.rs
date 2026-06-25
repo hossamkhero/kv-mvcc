@@ -8,9 +8,9 @@ pub enum OP {
 
 #[derive(Debug)]
 pub struct Action {
-    op: OP,
-    key: String,
-    value: String
+    pub op: OP,
+    pub key: String,
+    pub value: String
 }
 
 pub struct BitCursor<'a> {

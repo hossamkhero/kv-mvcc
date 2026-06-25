@@ -3,9 +3,11 @@
 use std::{collections::BTreeMap, sync::Arc};
 use std::{io};
 use tokio::net::TcpListener;
-use tokio::{io::{AsyncReadExt, AsyncWriteExt}, sync::Mutex};
+use tokio::{io::{AsyncReadExt, AsyncWriteExt}, sync::RwLock};
 
 use kv_mvcc::protocol::{BitCursor, decode_msg, Action, OP};
+
+use arc_swap::ArcSwap;
 
 enum StorageResult {
     Ok,
@@ -15,32 +17,46 @@ enum StorageResult {
     Value(Option<String>),
 }
 
-type Storage = Arc<Mutex<BTreeMap<String, String>>>;
+type Storage = Arc<RwLock<BTreeMap<String, ArcSwap<String>>>>;
 
-fn handle_storage(action: &Action, storage: &mut BTreeMap<String, String>) -> StorageResult {
+async fn handle_storage(action: &Action, thread_storage: &Storage) -> StorageResult { // &mut BTreeMap<String, String>) -> StorageResult {
     let Action { op, key, value } = action;
 
     match op {
         OP::Get => {
-            StorageResult::Value(storage.get(key).cloned())
+            let storage = thread_storage.read().await;
+            match storage.get(key) {
+                Some(value_cell) => {
+                    let value = value_cell.load();
+                    StorageResult::Value(Some((**value).clone()))
+                }
+                None => StorageResult::Value(None),
+            }
         }
         OP::Add => {
-            if storage.get(key).is_some() { return StorageResult::InsertedKeyAlreadyExists; }
+            let mut storage = thread_storage.write().await;
+            if storage.contains_key(key) { return StorageResult::InsertedKeyAlreadyExists; }
 
-            storage.insert(key.to_string(), value.to_string());
+            storage.insert(key.to_string(), ArcSwap::new(Arc::new(value.to_string())));
 
             StorageResult::Ok
         }
         OP::Update => {
-            match storage.get_mut(key) {
+            // We did this whole ArcSwap (Atomic<Arc<T>>) stuff to not need to writer lock the
+            // update branch.
+
+            let storage = thread_storage.read().await;
+
+            match storage.get(key) {
                 Some(v) => {
-                    *v = value.to_string();
+                    v.store(Arc::new(value.to_string()));
                     StorageResult::Ok
                 }
                 None => StorageResult::UpdateKeyDoesNotExist,
             }
         }
         OP::Remove => {
+            let mut storage = thread_storage.write().await;
             match storage.remove(key) {
                 Some(_) => StorageResult::Ok,
                 None => StorageResult::ToBeRemovedKeyDoesNotExist
@@ -66,9 +82,7 @@ async fn handle_client(socket: &mut tokio::net::TcpStream, thread_storage: Stora
 
         if n > 0 {
             let action = decode_msg(&mut cur);
-
-            let mut storage = thread_storage.lock().await;
-            let res = handle_storage(&action, &mut storage);
+            let res = handle_storage(&action, &thread_storage).await;
 
             match res {
                 StorageResult::Ok => {
@@ -104,7 +118,7 @@ async fn handle_client(socket: &mut tokio::net::TcpStream, thread_storage: Stora
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
-    let storage: Storage = Arc::new(Mutex::new(BTreeMap::new()));
+    let storage: Storage = Arc::new(RwLock::new(BTreeMap::new()));
 
     let addr = "0.0.0.0:9000";
 
